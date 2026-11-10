@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - botapi:/var/lib/telegram-bot-api
+
+  # Необязательно: локальный Bot API — файлы до 2 ГБ вместо 50/20 МБ.
+  # Запуск: docker compose --profile bigfiles up -d  (и BOT_API_URL в .env)
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    profiles: ["bigfiles"]
+    restart: always
+    env_file: .env
+    environment:
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - botapi:/var/lib/telegram-bot-api
+
+volumes:
+  botapi:
