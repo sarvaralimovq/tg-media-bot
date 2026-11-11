@@ -1,4 +1,0 @@
-aiogram>=3.13,<4
-yt-dlp[default]
-python-dotenv>=1.0
-deno
