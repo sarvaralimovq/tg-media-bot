@@ -12,6 +12,8 @@ import shutil
 import sys
 import time
 import uuid
+import datetime as dtm
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import yt_dlp
@@ -94,6 +96,9 @@ class OwnerOnly(BaseMiddleware):
             elif isinstance(event, CallbackQuery):
                 await event.answer("⛔", show_alert=False)
             return
+        if isinstance(event, Message) and event.text:
+            asyncio.create_task(sb_safe("POST", "tg_messages", body=[
+                {"owner_id": user.id, "kind": "text", "content": event.text[:4000]}]))
         return await handler(event, data)
 
 
@@ -555,6 +560,227 @@ async def process(action: str, param: str, job: dict, work: Path, st: Message) -
                                     duration=int(info["dur"]) or None, **big)
 
 
+# ================================================================ память и напоминания
+SB_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SB_KEY = os.getenv("SUPABASE_KEY", "").strip()
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL = os.getenv("AI_MODEL", "claude-haiku-5-5")
+TZ_NAME = os.getenv("TZ", "UTC")
+TZ = ZoneInfo(TZ_NAME)
+REMIND_HOUR = int(os.getenv("REMIND_HOUR", "9"))
+
+
+def utc_str(d: dtm.datetime) -> str:
+    return d.astimezone(dtm.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def sb(method: str, table: str, params: dict | None = None, body=None):
+    if not (SB_URL and SB_KEY):
+        raise RuntimeError("не заданы SUPABASE_URL / SUPABASE_KEY")
+    import aiohttp
+    headers = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
+               "Content-Type": "application/json", "Prefer": "return=representation"}
+    async with aiohttp.ClientSession(headers=headers) as s:
+        async with s.request(method, f"{SB_URL}/rest/v1/{table}", params=params, json=body,
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
+            txt = await r.text()
+            if r.status >= 300:
+                raise RuntimeError(f"Supabase {r.status}: {txt[:300]}")
+            return json.loads(txt) if txt else []
+
+
+async def sb_safe(*a, **kw):
+    try:
+        return await sb(*a, **kw)
+    except Exception as e:
+        log.warning("db: %s", e)
+        return []
+
+
+MONTHS = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "мая": 5, "май": 5, "июн": 6,
+          "июл": 7, "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12}
+DATE_RE = re.compile(
+    r"(\d{1,2})\s+(январ\w*|феврал\w*|март\w*|апрел\w*|ма[йя]\w*|июн\w*|июл\w*|август\w*|"
+    r"сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)(?:\s+(\d{4}))?", re.I)
+NUM_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?(?!\d)")
+REL_RE = re.compile(r"через\s+(\d+)\s*(?:дн|д\b)", re.I)
+
+
+def month_num(word: str) -> int | None:
+    w = word.lower()
+    for stem, n in MONTHS.items():
+        if w.startswith(stem):
+            return n
+    return None
+
+
+def find_date(text: str, now: dtm.datetime):
+    """Ищет дату в тексте. Возвращает (дата или None, текст без даты)."""
+    today = now.date()
+    m = DATE_RE.search(text)
+    if m:
+        mon = month_num(m.group(2))
+        y = int(m.group(3)) if m.group(3) else today.year
+        try:
+            d = dtm.date(y, mon, int(m.group(1)))
+        except (ValueError, TypeError):
+            return None, text
+        if not m.group(3) and d < today:
+            d = dtm.date(y + 1, mon, int(m.group(1)))
+        return d, (text[:m.start()] + text[m.end():]).strip()
+    m = NUM_DATE_RE.search(text)
+    if m:
+        try:
+            d = dtm.date(int(m.group(3)) if m.group(3) else today.year, int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None, text
+        if not m.group(3) and d < today:
+            d = dtm.date(d.year + 1, d.month, d.day)
+        return d, (text[:m.start()] + text[m.end():]).strip()
+    low = text.lower()
+    if "послезавтра" in low:
+        return today + dtm.timedelta(days=2), re.sub("послезавтра", "", text, flags=re.I).strip()
+    if "завтра" in low:
+        return today + dtm.timedelta(days=1), re.sub("завтра", "", text, flags=re.I).strip()
+    m = REL_RE.search(text)
+    if m:
+        return today + dtm.timedelta(days=int(m.group(1))), (text[:m.start()] + text[m.end():]).strip()
+    return None, text
+
+
+@dp.message(Command("memory"))
+async def cmd_memory(m: Message):
+    try:
+        rows = await sb("GET", "tg_memories", params={
+            "owner_id": f"eq.{m.from_user.id}", "order": "created_at.desc", "limit": "30", "select": "content"})
+    except Exception as e:
+        return await m.answer(f"❌ База недоступна: {e}")
+    if not rows:
+        return await m.answer("🧠 Пока ничего не запомнил. Напиши: «запомни что ...»")
+    await m.answer("🧠 Что я помню:\n" + "\n".join(f"• {r['content']}" for r in rows))
+
+
+@dp.message(Command("reminders"))
+async def cmd_reminders(m: Message):
+    try:
+        rows = await sb("GET", "tg_reminders", params={
+            "owner_id": f"eq.{m.from_user.id}", "sent": "eq.false", "order": "fire_at.asc",
+            "limit": "30", "select": "text,event_date,fire_at"})
+    except Exception as e:
+        return await m.answer(f"❌ База недоступна: {e}")
+    if not rows:
+        return await m.answer("📅 Активных напоминаний нет.")
+    lines = []
+    for r in rows:
+        fire = dtm.datetime.fromisoformat(r["fire_at"].replace("Z", "+00:00")).astimezone(TZ)
+        lines.append(f"• {fire:%d.%m %H:%M} — {r['text']} (событие {r['event_date']})")
+    await m.answer("📅 Ближайшие напоминания:\n" + "\n".join(lines))
+
+
+@dp.message(Command("history"))
+async def cmd_history(m: Message):
+    try:
+        rows = await sb("GET", "tg_messages", params={
+            "owner_id": f"eq.{m.from_user.id}", "order": "created_at.desc", "limit": "15",
+            "select": "content,created_at"})
+    except Exception as e:
+        return await m.answer(f"❌ База недоступна: {e}")
+    if not rows:
+        return await m.answer("Истории пока нет.")
+    lines = []
+    for r in reversed(rows):
+        t = dtm.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).astimezone(TZ)
+        lines.append(f"{t:%d.%m %H:%M} — {(r['content'] or '')[:120]}")
+    await m.answer("🗂 Последние сообщения:\n" + "\n".join(lines))
+
+
+async def ask_ai(uid: int, text: str) -> str:
+    import aiohttp
+    mems = await sb("GET", "tg_memories", params={
+        "owner_id": f"eq.{uid}", "order": "created_at.desc", "limit": "30", "select": "content"})
+    facts = "\n".join("- " + r["content"] for r in mems) or "пока ничего"
+    system = ("Ты личный ассистент владельца в Telegram. Отвечай по-русски, коротко и дружелюбно. "
+              "Вот что ты помнишь о нём:\n" + facts)
+    body = {"model": AI_MODEL, "max_tokens": 700, "system": system,
+            "messages": [{"role": "user", "content": text}]}
+    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    async with aiohttp.ClientSession() as s:
+        async with s.post("https://api.anthropic.com/v1/messages", headers=headers, json=body,
+                          timeout=aiohttp.ClientTimeout(total=60)) as r:
+            j = await r.json()
+            if r.status >= 300:
+                raise RuntimeError(str(j)[:300])
+    return j["content"][0]["text"]
+
+
+@dp.message(F.text)
+async def on_text(m: Message):
+    text = m.text.strip()
+    low = text.lower()
+    uid = m.from_user.id
+    try:
+        if low.startswith(("запомни", "запомнить")):
+            content = re.sub(r"^запомни(ть)?\s*(,|что|:)?\s*", "", text, flags=re.I).strip()
+            if not content:
+                return await m.answer("Что запомнить? Например: «запомни что мой экзамен по математике»")
+            await sb("POST", "tg_memories", body=[{"owner_id": uid, "content": content}])
+            return await m.answer(f"🧠 Запомнил: {content}")
+
+        if low.startswith(("напомни", "напоминание")):
+            now = dtm.datetime.now(TZ)
+            event_date, rest = find_date(text, now)
+            if not event_date:
+                return await m.answer(
+                    "📅 Укажи дату. Примеры:\n«напомни 10 декабря сдать экзамен»\n"
+                    "«напомни завтра позвонить маме»\n«напомни через 3 дня оплатить счёт»")
+            what = re.sub(r"^напомни(ть)?\s*(мне)?\s*(что|про|о)?\s*", "", rest, flags=re.I).strip() or "дело"
+            fires = []
+            for k in (3, 2, 1):  # за 3, 2 и 1 день, в REMIND_HOUR:00
+                f = dtm.datetime.combine(event_date - dtm.timedelta(days=k),
+                                         dtm.time(REMIND_HOUR, 0), tzinfo=TZ)
+                if f > now:
+                    fires.append((k, f))
+            if not fires:  # дата слишком близко — одно напоминание через минуту
+                fires = [(0, now + dtm.timedelta(minutes=1))]
+            rows = [{"owner_id": uid, "text": what, "event_date": event_date.isoformat(),
+                     "fire_at": utc_str(f)} for _, f in fires]
+            await sb("POST", "tg_reminders", body=rows)
+            when = ", ".join(f"{f:%d.%m %H:%M}" for _, f in fires)
+            return await m.answer(
+                f"✅ Записал: «{what}» — событие {event_date:%d.%m.%Y}.\n"
+                f"⏰ Напомню: {when} ({TZ_NAME})")
+
+        if ANTHROPIC_KEY:
+            return await m.answer(await ask_ai(uid, text))
+        await m.answer(
+            "Я понимаю:\n• «запомни что …» — сохраню в память\n"
+            "• «напомни 10 декабря …» — напомню за 3, 2 и 1 день\n"
+            "• /memory, /reminders, /history — посмотреть\n"
+            "• ссылку, видео или звук — скачаю или сделаю кружок/голосовое\n\n"
+            "Чтобы я отвечал как ИИ, добавь ANTHROPIC_API_KEY в настройки.")
+    except Exception as e:
+        log.exception("text handler")
+        await m.answer(f"❌ Ошибка: {str(e)[:300]}")
+
+
+async def reminder_loop():
+    """Каждые 30 сек проверяет, что пора отправить."""
+    while True:
+        try:
+            if OWNER_ID and SB_URL and SB_KEY:
+                now = utc_str(dtm.datetime.now(dtm.timezone.utc))
+                due = await sb("GET", "tg_reminders", params={
+                    "sent": "eq.false", "fire_at": f"lte.{now}", "owner_id": f"eq.{OWNER_ID}",
+                    "select": "id,text,event_date"})
+                for r in due:
+                    await bot.send_message(OWNER_ID, f"⏰ Напоминание: {r['text']}\n📅 Событие: {r['event_date']}")
+                    await sb("PATCH", "tg_reminders", params={"id": f"eq.{r['id']}"}, body={"sent": True})
+        except Exception as e:
+            log.warning("reminder loop: %s", e)
+        await asyncio.sleep(30)
+
+
 @dp.message()
 async def fallback(m: Message):
     await m.answer("Пришли ссылку, видео или звук. /help — подсказка.")
@@ -611,6 +837,7 @@ async def main():
         print("❌ Нет BOT_TOKEN. Запусти setup_token.ps1 или впиши токен в файл .env")
         sys.exit(1)
     asyncio.create_task(cleanup_loop())
+    asyncio.create_task(reminder_loop())
     me = await bot.get_me()
     log.info("Бот @%s запущен. Владелец: %s", me.username, OWNER_ID or "ещё не задан — напиши боту /start")
     base_url = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")

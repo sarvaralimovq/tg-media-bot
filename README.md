@@ -46,3 +46,19 @@
 IP облаков часто блокируются YouTube. Установи в браузер расширение
 «Get cookies.txt LOCALLY», экспортируй cookies с youtube.com (и instagram.com) в файл
 `cookies.txt` и просто пришли его боту.
+
+## Память и напоминания
+- Все сообщения сохраняются в Supabase (таблица `tg_messages`), посмотреть: `/history`.
+- «запомни что …» — сохраняет факт, список: `/memory`.
+- «напомни 10 декабря сдать экзамен» — напомнит **7, 8 и 9 декабря** в `REMIND_HOUR` (по умолчанию 9:00 по `TZ`). Список: `/reminders`.
+  Понимает также «завтра …», «послезавтра …», «через 3 дня …», «10.12 …».
+- Свободный текст: если задан `ANTHROPIC_API_KEY`, бот отвечает как ИИ и учитывает то, что запомнил. Модель: `AI_MODEL` (по умолчанию `claude-haiku-5-5`).
+
+### Переменные окружения
+| Переменная | Что это |
+|---|---|
+| `SUPABASE_URL` | `https://xmrxkuqareicdslioxzo.supabase.co` |
+| `SUPABASE_KEY` | **secret / service_role** ключ из Supabase → Project Settings → API. Не публичный ключ! |
+| `ANTHROPIC_API_KEY` | (необязательно) ключ с console.anthropic.com |
+| `TZ` | часовой пояс, например `Asia/Tashkent` |
+| `REMIND_HOUR` | час напоминаний, по умолчанию 9 |

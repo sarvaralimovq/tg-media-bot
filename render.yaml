@@ -9,7 +9,19 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: OWNER_ID
+        value: "551892048"
+      - key: SUPABASE_URL
+        value: https://xmrxkuqareicdslioxzo.supabase.co
+      - key: SUPABASE_KEY
         sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: claude-haiku-5-5
+      - key: TZ
+        value: UTC
+      - key: REMIND_HOUR
+        value: "9"
       - key: FFMPEG_PRESET
         value: ultrafast
       - key: KEEP_ALIVE
